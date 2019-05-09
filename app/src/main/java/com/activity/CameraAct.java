@@ -282,6 +282,7 @@ public class CameraAct extends AppCompatActivity implements Camera.PreviewCallba
                 Camera.Size size1 = previewSizes.get(Integer.parseInt(sizeIndex.getText().toString()));//default 2,4
                 Timber.d("prepare start preview , widht : %s, height : %s", size1.width, size1.height);
                 parameters.setPreviewSize(size1.width, size1.height);
+                previewSize =  mCamera.new Size(size1.width,size1.height);
                 mCamera.setParameters(parameters);
                 mCamera.startPreview();
             }
@@ -370,6 +371,7 @@ public class CameraAct extends AppCompatActivity implements Camera.PreviewCallba
             Timber.d("后置摄像头，显示Orientation is : %d", result);
         }
         mOrienta = result;
+        rotateMatrix = getRotateMatrix(mOrienta);
         camera.setDisplayOrientation(result);
     }
 
@@ -397,10 +399,26 @@ public class CameraAct extends AppCompatActivity implements Camera.PreviewCallba
         }
     }
 
+    private Matrix getRotateMatrix(int orientation){
+        Matrix mMatrix = new Matrix();
+        switch (orientation) {
+            case 90:
+                mMatrix.postRotate(270);
+                break;
+            case 270:
+                mMatrix.postRotate(90);
+                break;
+            default:
+                mMatrix.postRotate(orientation);
+                break;
+        }
+        return mMatrix;
+    }
+
     private class FaceThread implements Runnable {
         private byte[] mData;
         private ByteArrayOutputStream mBitmapOutput;//mUploadOutp1ut
-        private Matrix mMatrix;
+        //private Matrix mMatrix;
         private Message mMessage;
         private Camera mtCamera;
         private int index;
@@ -409,7 +427,7 @@ public class CameraAct extends AppCompatActivity implements Camera.PreviewCallba
             mData = data;
             mBitmapOutput = new ByteArrayOutputStream();
             mMessage = mHandler.obtainMessage();
-            mMatrix = new Matrix();
+            /*mMatrix = new Matrix();
             switch (mOrienta) {
                 case 90:
                     mMatrix.postRotate(270);
@@ -420,7 +438,7 @@ public class CameraAct extends AppCompatActivity implements Camera.PreviewCallba
                 default:
                     mMatrix.postRotate(mOrienta);
                     break;
-            }
+            }*/
             // mMatrix.postScale(-1, 1);//水平
             mtCamera = camera;
             this.index = index;
@@ -435,18 +453,21 @@ public class CameraAct extends AppCompatActivity implements Camera.PreviewCallba
             int type = -1;
             boolean findFace = false;
             try {
-                Camera.Size size = mtCamera.getParameters().getPreviewSize();
-                YuvImage yuvImage = new YuvImage(mData, ImageFormat.NV21, size.width, size.height, null);
+                int width = previewSize.width;
+                int height = previewSize.height;
+                YuvImage yuvImage = new YuvImage(mData, ImageFormat.NV21, width, height, null);
                 mData = null;
-                yuvImage.compressToJpeg(new Rect(0, 0, size.width, size.height), 100, mBitmapOutput);
+                yuvImage.compressToJpeg(new Rect(0, 0, width, height), 100, mBitmapOutput);
+                //必须要一致，否则做不到优化一倍内存
+                Timber.d("YUVImage size ： %d, IOBuffer size is : %d", yuvImage.getYuvData().length, mBitmapOutput.size());
                 BitmapFactory.Options options = new BitmapFactory.Options();
 //               options.inSampleSize =2;
                 options.inPreferredConfig = Bitmap.Config.RGB_565;//必须设置为565，否则无法检测
                 // 转换成图片
-                bitmap = BitmapFactory.decodeByteArray(mBitmapOutput.toByteArray(), 0, mBitmapOutput.toByteArray().length, options);
+                bitmap = BitmapFactory.decodeByteArray(mBitmapOutput.toByteArray(), 0, mBitmapOutput.size(), options);
                 if (bitmap != null) {
                     mBitmapOutput.reset();
-                    bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), mMatrix, false);
+                    bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), rotateMatrix, false);
                     final Bitmap mBitmap = bitmap;
                     runOnUiThread(new Runnable() {
                         @Override
@@ -558,7 +579,8 @@ public class CameraAct extends AppCompatActivity implements Camera.PreviewCallba
     private long time;
     private boolean isFirst = true, xzzd = false;
     private boolean isExpend = false;
-
+    private Matrix rotateMatrix;
+    private Camera.Size previewSize;
 
     private void showToast(String msg) {
         Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();

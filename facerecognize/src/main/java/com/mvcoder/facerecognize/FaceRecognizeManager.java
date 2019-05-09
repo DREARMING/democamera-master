@@ -7,6 +7,7 @@ import android.graphics.ImageFormat;
 import android.graphics.Matrix;
 import android.graphics.Point;
 import android.graphics.Rect;
+import android.graphics.SurfaceTexture;
 import android.graphics.YuvImage;
 import android.hardware.Camera;
 import android.media.FaceDetector;
@@ -14,25 +15,34 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.support.annotation.NonNull;
 import android.view.Surface;
+import android.view.TextureView;
+import android.view.View;
 import android.view.WindowManager;
+import android.widget.FrameLayout;
 
+import com.mvcoder.facerecognize.utils.ByteArrayOutputStreamCounter;
 import com.mvcoder.facerecognize.utils.FaceHelper;
 import com.mvcoder.facerecognize.utils.IPreviewPolicy;
 import com.mvcoder.facerecognize.utils.PreviewPolicy;
+import com.mvcoder.facerecognize.view.AutoFitTextureView;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import timber.log.Timber;
 
 public class FaceRecognizeManager implements IFaceRecognizeManager {
 
-
-    private Context context;
     private FindFaceListener findFaceListener;
+    private final static String TAG_TEXTURE_VIEW = "TAG_TEXTUREVIEW";
     private Camera mCamera;
     private int cameraId = -1;
+
+    //private volatile boolean isFaceRecRunning = false;
+    private AtomicInteger faceRecRunningState = new AtomicInteger(0);
+
     /**
      * 预览界面和拍摄到的图片 需要旋转到正确的视角的角度
      */
@@ -47,28 +57,156 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
 
     private FaceRecPreviewCallback previewCallback;
 
-    private HandlerThread mFaceHandlerThread = new HandlerThread("FaceHandlerThread", Thread.MAX_PRIORITY);
-    private Handler mFaceHandle = new Handler(mFaceHandlerThread.getLooper());
+    private HandlerThread mFaceHandlerThread;
+    private volatile Handler mFaceHandle;
     private FaceHelper mFaceHelper = FaceHelper.getInstance();
 
-    @Override
-    public void startFaceRecognize() {
+    private static volatile FaceRecognizeManager manager;
 
+    public static FaceRecognizeManager getInstance(){
+        if(manager == null){
+            synchronized (FaceRecognizeManager.class){
+                if(manager == null){
+                    manager = new FaceRecognizeManager();
+                }
+            }
+        }
+        return manager;
     }
 
     @Override
-    public void stopFaceRecognize() {
+    public void startFaceRecognize(@NonNull Context context,@NonNull FrameLayout frameLayout,@NonNull Rect rect) {
+        if(!faceRecRunningState.compareAndSet(0, 1)) return;
+        /*if(isFaceRecRunning) return;
+        isFaceRecRunning = true;*/
+        //开始人脸识别线程
+        runFaceRecThread();
+        //UI操作，注意线程环境
+        AutoFitTextureView textureView = new AutoFitTextureView(context);
+        textureView.setTag(TAG_TEXTURE_VIEW);
+        FrameLayout.LayoutParams layoutParams = new FrameLayout.LayoutParams(rect.width(),rect.height());
+        layoutParams.topMargin=rect.top;
+        layoutParams.leftMargin=rect.left;
+        textureView.setLayoutParams(layoutParams);
+        setSurfaceTextureListener(context, textureView);
+
+        //添加到容器类中，当可见之后，将会初始化摄像头
+        frameLayout.addView(textureView,0);
+    }
+
+    @Override
+    public void stopFaceRecognize(@NonNull FrameLayout surfaceContainer) {
+        //if(!isFaceRecRunning) return;
+        if(!faceRecRunningState.compareAndSet(2,3)) return;
+        if(mCamera != null) {
+            View view = surfaceContainer.findViewWithTag(TAG_TEXTURE_VIEW);
+            if (view == null) throw new IllegalStateException("can't find textureview!!");
+            surfaceContainer.removeView(view);
+        }
+    }
+
+    @Override
+    public void setFindFaceListener(FindFaceListener findFaceListener) {
+        this.findFaceListener = findFaceListener;
+    }
+
+    private void setSurfaceTextureListener(final Context context, AutoFitTextureView textureView) {
+        textureView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+            @Override
+            public void onSurfaceTextureAvailable(final SurfaceTexture surface, int width, int height) {
+                //main 线程
+                Timber.d("surface texture size, width : %d, height: %d", width, height);
+                if(mTextureViewPoint == null){
+                    int w = width;
+                    int h = height;
+                    if(width < height){
+                        w = height;
+                        h = width;
+                    }
+                    mTextureViewPoint = new Point(w, h);
+                }
+                if(mCamera == null && mFaceHandle != null){
+                    mFaceHandle.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            //耗时操作，异步执行
+                            openCamera(context, surface);
+                            faceRecRunningState.compareAndSet(1,2);
+                        }
+                    });
+
+                }
+            }
+
+            @Override
+            public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) {
+
+            }
+
+            @Override
+            public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
+                if(mFaceHandle != null){
+                    mFaceHandle.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            closeCamera();
+                            stopFaceRecThread();
+                        }
+                    });
+                }
+                return true;
+            }
+
+            @Override
+            public void onSurfaceTextureUpdated(SurfaceTexture surface) {
+
+            }
+        });
+    }
+
+    private void runFaceRecThread(){
+        //提高线程的优先级，让人脸识别操作调度得密集点
+        mFaceHandlerThread = new HandlerThread("FaceHandlerThread", Thread.MAX_PRIORITY);
+        mFaceHandlerThread.start();
+        //耗时，等待 mFaceHandlerThread 初始化looper才行
+        mFaceHandle = new Handler(mFaceHandlerThread.getLooper());
+    }
+
+    private  void stopFaceRecThread(){
+        //结束线程
+        if(mFaceHandlerThread != null)
+            mFaceHandlerThread.quit();
+        mFaceHandle = null;
+        mFaceHandlerThread = null;
+        Timber.d("FaceHandlerThread stop");
+        //这里是一次人脸识别的终点
+        //isFaceRecRunning = false;
+        faceRecRunningState.compareAndSet(3,0);
 
     }
 
-    private void openCamera() {
+    private synchronized void closeCamera() {
+        if(mCamera != null){
+            mCamera.setOneShotPreviewCallback(null);
+            mCamera.stopPreview();
+            mCamera.release();
+            mCamera = null;
+            Timber.d("camera close");
+        }
+    }
+
+    private void openCamera(Context context, SurfaceTexture surface) {
         try {
             if (mCamera == null) {
                 //如果找不到前置摄像头，将会找后置摄像头
                 cameraId = getFrontCameraId();
                 mCamera = Camera.open(cameraId);//可以根据ID使用不同的摄像头
             }
+            mCamera.setPreviewTexture(surface);
         } catch (RuntimeException e) {
+            e.printStackTrace();
+            Timber.e(e);
+        } catch (IOException e) {
             e.printStackTrace();
             Timber.e(e);
         }
@@ -76,15 +214,15 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
             Timber.e("获取摄像头失败");
             throw new IllegalStateException("无法打开Camera，请检查设备是否具备摄像头");
         }
-        if (mCamera != null) {
-            initCameraParas();
-        }
+        initCameraParas(context);
         startPreview();
     }
 
-    private void initCameraParas(){
+    private void initCameraParas(Context context){
         //纠正预览界面角度
-        setCameraDisplayOrientation(cameraId, mCamera);
+        //mOrienta 记录预览画面的偏移
+        mOrienta = setCameraDisplayOrientation(context, cameraId, mCamera);
+
         Camera.Parameters parameters = mCamera.getParameters();
         List<Camera.Size> previewSizes = parameters.getSupportedPreviewSizes();//获得相机预览所支持的大小。
         Timber.d("supportPreviewSize num is : %d", previewSizes != null ? previewSizes.size() : 0);
@@ -109,25 +247,25 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
         Camera.Size size1 = previewSizes.get(bestPreviewIndex);//default 2,4
         Timber.d("prepare start preview , widht : %s, height : %s", size1.width, size1.height);
         parameters.setPreviewSize(size1.width, size1.height);
+
+
+        Camera.Size previewSize = mCamera.new Size(size1.width, size1.height);
         mCamera.setParameters(parameters);
+
+        ///初始化预览 callback
+        if(previewCallback == null) {
+            //拍摄的照片都需要用Matrix进行旋转，每个Matrix都是用这个旋转角度，基本不会发生变化，可以重用一个Matrix呢
+            previewCallback = new FaceRecPreviewCallback(previewSize, getRotateMatrix(mOrienta));
+        }
     }
 
 
     private void startPreview(){
         if(mCamera != null){
-            if(previewCallback == null) {
-                previewCallback = new FaceRecPreviewCallback();
-            }
             //设置一次性预览监听
             mCamera.setOneShotPreviewCallback(previewCallback);
             mCamera.startPreview();
-        }
-    }
-
-    private void stopPreview(){
-        if(mCamera != null){
-            mCamera.setOneShotPreviewCallback(null);
-            mCamera.stopPreview();
+            Timber.d("camera start preview");
         }
     }
 
@@ -154,7 +292,7 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
      * @param cameraId
      * @param camera
      */
-    private void setCameraDisplayOrientation(int cameraId, android.hardware.Camera camera) {
+    private int setCameraDisplayOrientation(@NonNull Context context, int cameraId, android.hardware.Camera camera) {
         android.hardware.Camera.CameraInfo info = new android.hardware.Camera.CameraInfo();
         android.hardware.Camera.getCameraInfo(cameraId, info);
         WindowManager windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
@@ -184,11 +322,11 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
             result = (info.orientation - degrees + 360) % 360;
             Timber.d("后置摄像头，显示Orientation is : %d", result);
         }
-        //记录预览画面的偏移
-        mOrienta = result;
         //当前Activity旋转的角度
         this.displayOrientation = degrees;
+
         camera.setDisplayOrientation(result);
+        return result;
     }
 
     private static int findBestPreviewSizeIndex(@NonNull List<Camera.Size> previewSizes, @NonNull Point textureResoulution) {
@@ -217,8 +355,16 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
 
         private IPreviewPolicy previewPolicy = new PreviewPolicy();
 
-        public FaceRecPreviewCallback(){
+        private Camera.Size previewSize;
+        private Matrix matrix;
+        /**
+         * 用于记录 jpg buffer 最大的字节数，避免申请过多字节
+         */
+        private ByteArrayOutputStreamCounter counter = new ByteArrayOutputStreamCounter(8192);
 
+        public FaceRecPreviewCallback(@NonNull Camera.Size previewSize, @NonNull Matrix matrix){
+            this.previewSize = previewSize;
+            this.matrix = matrix;
         }
 
         @Override
@@ -229,10 +375,9 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
             }
             //增加预览次数
             previewPolicy.incrementPreviewNum();
-            Timber.i("收到相机回调：onpreviewframe() , index : %d", index);
-            if (data != null && data.length > 0) {
-                if(mFaceHandle != null)
-                    mFaceHandle.post(new FaceRecTask(data, camera, (++index)));
+            Timber.i("收到相机回调：onpreviewframe() , index : %d", index++);
+            if (data != null && data.length > 0 && mFaceHandle != null) {
+                mFaceHandle.post(new FaceRecTask(data, previewSize, matrix, counter, previewPolicy));
             }else{
                 //记录预览失败
                 previewPolicy.previewState(false);
@@ -247,31 +392,37 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
         }
     }
 
+    private Matrix getRotateMatrix(int orientation){
+        Matrix mMatrix = new Matrix();
+        switch (orientation) {
+            case 90:
+                mMatrix.postRotate(270);
+                break;
+            case 270:
+                mMatrix.postRotate(90);
+                break;
+            default:
+                mMatrix.postRotate(orientation);
+                break;
+        }
+        return mMatrix;
+    }
+
     class FaceRecTask implements Runnable {
 
         private byte[] mData;
-        private ByteArrayOutputStream mBitmapOutput;//mUploadOutp1ut
-        private Matrix mMatrix;
-        private Camera mtCamera;
+        private Camera.Size previewSize;
+        private Matrix matrix;
+        private ByteArrayOutputStreamCounter counter;
+        private IPreviewPolicy previewPolicy;
 
-        public FaceRecTask(byte[] data, Camera camera, int index) {
+        public FaceRecTask(@NonNull byte[] data, @NonNull Camera.Size preiviewSize, @NonNull Matrix mOrientMatrix,
+                           @NonNull ByteArrayOutputStreamCounter counter,@NonNull IPreviewPolicy previewPolicy) {
             mData = data;
-            mBitmapOutput = new ByteArrayOutputStream();
-            mMatrix = new Matrix();
-            mMatrix.reset();
-            switch (mOrienta) {
-                case 90:
-                    mMatrix.postRotate(270);
-                    break;
-                case 270:
-                    mMatrix.postRotate(90);
-                    break;
-                default:
-                    mMatrix.postRotate(mOrienta);
-                    break;
-            }
-            // mMatrix.postScale(-1, 1);//水平
-            mtCamera = camera;
+            this.previewSize = preiviewSize;
+            this.matrix = mOrientMatrix;
+            this.counter = counter;
+            this.previewPolicy = previewPolicy;
         }
 
         @Override
@@ -280,44 +431,63 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
             Bitmap mFaceBitmap = null;
             long startTime = System.currentTimeMillis(), endTime = 0;
             String logMsg = " ";
-            int type = -1;
+            //int type = -1;
             boolean findFace = false;
+            ByteArrayOutputStream mBitmapOutput = null;
             try {
-                Camera.Size size = mtCamera.getParameters().getPreviewSize();
-                YuvImage yuvImage = new YuvImage(mData, ImageFormat.NV21, size.width, size.height, null);
-                mData = null;
-                yuvImage.compressToJpeg(new Rect(0, 0, size.width, size.height), 100, mBitmapOutput);
+                int width = previewSize.width;
+                int height = previewSize.height;
+                YuvImage yuvImage = new YuvImage(mData, ImageFormat.NV21, width, height, null);
+                mData = null;   //方便内存回收
+                //设置初始化大小，防止多次grow造成的严重的性能损耗
+                mBitmapOutput = new ByteArrayOutputStream(counter.getMaxBufferSize());
+                yuvImage.compressToJpeg(new Rect(0, 0, width, height), 100, mBitmapOutput);
+                /*//必须要一致，否则做不到优化一倍内存
+                Timber.d("YUVImage size ： %d, IOBuffer size is : %d", yuvImage.getYuvData().length, mBitmapOutput.size());*/
+                counter.save(mBitmapOutput.size());
+
                 BitmapFactory.Options options = new BitmapFactory.Options();
                 options.inPreferredConfig = Bitmap.Config.RGB_565;//必须设置为565，否则无法检测
-                // 转换成图片
-                bitmap = BitmapFactory.decodeByteArray(mBitmapOutput.toByteArray(), 0, mBitmapOutput.toByteArray().length, options);
+
+                bitmap = BitmapFactory.decodeByteArray(mBitmapOutput.toByteArray(), 0, mBitmapOutput.size(), options);
                 if (bitmap != null) {
                     mBitmapOutput.reset();
-                    bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), mMatrix, false);
-                    final Bitmap mBitmap = bitmap;
-                    endTime = System.currentTimeMillis();
-                    logMsg = "识别人脸前耗时时间：" + (endTime - startTime);
-                    FaceDetector.Face[] faces = mFaceHelper.findFaces(bitmap);
-                    logMsg = logMsg + ",==识别人脸时间:" + (System.currentTimeMillis() - endTime) + ",mOrienta:" + mOrienta + ",w:" + mBitmap.getWidth() + ",h:" + mBitmap.getHeight() + ",degrees:" + displayOrientation;//width:"+mBitMap.getWidth()+",height:"+mBitMap.getHeight()+",
-                    //Logger.i(TAG + logMsg);
-                    FaceDetector.Face facePostion = null;
+                    mFaceBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.getWidth(), bitmap.getHeight(), matrix, false);
+                    if(BuildConfig.DEBUG) {
+                        endTime = System.currentTimeMillis();
+                        logMsg = "识别人脸前耗时时间：" + (endTime - startTime);
+                    }
+                    FaceDetector.Face[] faces = mFaceHelper.findFaces(mFaceBitmap);
+                    if(BuildConfig.DEBUG) {
+                        logMsg = logMsg + ",==识别人脸时间:" + (System.currentTimeMillis() - endTime) + ",mOrienta:" + mOrienta + ",w:" + mFaceBitmap.getWidth() + ",h:" + mFaceBitmap.getHeight() + ",degrees:" + displayOrientation;//width:"+mBitMap.getWidth()+",height:"+mBitMap.getHeight()+",
+                        Timber.d(logMsg);
+                    }
+                    //FaceDetector.Face facePostion = null;
                     if (faces != null) {
                         for (FaceDetector.Face face : faces) {
                             if (face == null) {
                                 bitmap.recycle();
                                 bitmap = null;
+                                mFaceBitmap.recycle();
+                                mFaceBitmap = null;
                                 mBitmapOutput.close();
                                 mBitmapOutput = null;
                                 //Logger.e("无人脸");
-                                type = 0;
+                                //type = 0;
                                 break;
                             } else {
                                 //Logger.e("有人脸");
-                                facePostion = face;
+                               // facePostion = face;
                                 findFace = true;
-                                type = 1;
+                                Timber.d("有人脸");
+                                //type = 1;
                                 break;
                             }
+                        }
+                        if(findFace && findFaceListener != null){
+                            findFaceListener.onFaceFind(mFaceBitmap);
+                            previewPolicy.previewState(true);
+                            resetPreviewCallback();
                         }
                     }
                 }
@@ -328,7 +498,7 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
                     bitmap.recycle();
                     bitmap = null;
                 }
-                if (mFaceBitmap != null) {
+                if (mFaceBitmap != null && !findFace) {
                     mFaceBitmap.recycle();
                     mFaceBitmap = null;
                 }
@@ -342,6 +512,7 @@ public class FaceRecognizeManager implements IFaceRecognizeManager {
                 }
                 //没有找到人脸信息，赶紧重拍
                 if (!findFace) {
+                    previewPolicy.previewState(false);
                     resetPreviewCallback();
                 }
             }

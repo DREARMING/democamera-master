@@ -29,4 +29,5 @@ dependencies {
     implementation 'com.orhanobut:logger:1.15'
     implementation 'pub.devrel:easypermissions:0.2.0'
     implementation project(':log')
+    implementation project(':facerecognize')
 }
