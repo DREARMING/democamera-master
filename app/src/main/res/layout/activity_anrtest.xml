@@ -16,6 +16,15 @@
         app:layout_constraintEnd_toEndOf="parent" />
 
     <Button
+        android:id="@+id/btJavaCrash"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="make java crash"
+        app:layout_constraintTop_toBottomOf="@+id/btRegister"
+        tools:layout_editor_absoluteX="8dp" />
+
+    <Button
         android:id="@+id/btRegister"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
